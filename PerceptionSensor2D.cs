@@ -19,7 +19,7 @@ using Simulator.Analysis;
 namespace Simulator.Sensors
 {
     [SensorType("2D Perception", new[] { typeof(Detected2DObjectData) })]
-    public class Perception2DSensor : SensorBase
+    public class PerceptionSensor2D : SensorBase
     {
         [SensorParameter]
         [Range(1f, 100f)]
