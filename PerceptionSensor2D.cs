@@ -254,9 +254,9 @@ namespace Simulator.Sensors
 
             if (parent.layer == LayerMask.NameToLayer("Agent"))
             {
-                var egoC = parent.GetComponent<VehicleController>();
+                var controller = parent.GetComponent<IAgentController>();
                 var rb = parent.GetComponent<Rigidbody>();
-                id = egoC.GTID;
+                id = controller.GTID;
                 label = "Sedan";
                 linear_vel = Vector3.Dot(rb.velocity, other.transform.forward);
                 angular_vel = -rb.angularVelocity.y;
