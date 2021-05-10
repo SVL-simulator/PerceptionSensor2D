@@ -70,14 +70,15 @@ namespace Simulator.Sensors
         [AnalysisMeasurement(MeasurementType.Count)]
         public int MaxTracked = -1;
         
-        public override SensorDistributionType DistributionType => SensorDistributionType.HighLoad;
+        public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
+        public override float PerformanceLoad { get; } = 0.2f;
 
         private void Awake()
         {
             Camera = GetComponentInChildren<Camera>();
         }
 
-        private void Start()
+        protected override void Initialize()
         {
             activeRT = new RenderTexture(Width, Height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
             {
@@ -112,16 +113,16 @@ namespace Simulator.Sensors
             cameraRangeTrigger.SetCallbacks(OnCollider);
         }
 
+        protected override void Deinitialize()
+        {
+            if (activeRT != null)
+                activeRT.Release();
+        }
+
         public override void OnBridgeSetup(BridgeInstance bridge)
         {
             Bridge = bridge;
             Publish = Bridge.AddPublisher<Detected2DObjectData>(Topic);
-        }
-
-        void OnDestroy()
-        {
-            if (activeRT != null)
-                activeRT.Release();
         }
 
         private void Update()
