@@ -73,6 +73,9 @@ namespace Simulator.Sensors
         public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
         public override float PerformanceLoad { get; } = 0.2f;
 
+        private IVehicleDynamics Dynamics;
+        private IAgentController Controller;
+
         private void Awake()
         {
             Camera = GetComponentInChildren<Camera>();
@@ -80,6 +83,8 @@ namespace Simulator.Sensors
 
         protected override void Initialize()
         {
+            Dynamics = GetComponentInParent<IVehicleDynamics>();
+            Controller = GetComponentInParent<IAgentController>();
             activeRT = new RenderTexture(Width, Height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
             {
                 dimension = UnityEngine.Rendering.TextureDimension.Tex2D,
@@ -255,12 +260,10 @@ namespace Simulator.Sensors
 
             if (parent.layer == LayerMask.NameToLayer("Agent"))
             {
-                var controller = parent.GetComponent<IAgentController>();
-                var rb = parent.GetComponent<Rigidbody>();
-                id = controller.GTID;
+                id = Controller.GTID;
                 label = "Sedan";
-                linear_vel = Vector3.Dot(rb.velocity, other.transform.forward);
-                angular_vel = -rb.angularVelocity.y;
+                linear_vel = Vector3.Dot(Dynamics.Velocity, other.transform.forward);
+                angular_vel = -Dynamics.AngularVelocity.y;
             }
             else if (parent.layer == LayerMask.NameToLayer("NPC"))
             {
