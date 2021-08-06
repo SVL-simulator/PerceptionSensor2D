@@ -1,0 +1,52 @@
+/**
+* Copyright (c) 2021 LG Electronics, Inc.
+*
+* This software contains code licensed as described in LICENSE.
+*
+*/
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+#include "Packages/com.unity.render-pipelines.high-definition/Runtime/ShaderLibrary/TextureXR.hlsl"
+#pragma only_renderers d3d11 vulkan metal
+
+#pragma kernel Detect
+#pragma kernel Clear
+
+CBUFFER_START(cb0)
+    float4 _TexSize;                // Rendering resolution: x: width, y: height, z: 1/width, w: 1/height
+    float4 _Color;
+CBUFFER_END
+
+TEXTURE2D_X(_Input);
+
+RWStructuredBuffer<uint> _MinX;
+RWStructuredBuffer<uint> _MaxX;
+RWStructuredBuffer<uint> _MinY;
+RWStructuredBuffer<uint> _MaxY;
+
+[numthreads(64,1,1)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+    _MinX[id.x] = _TexSize.x - 1u;
+    _MaxX[id.x] = 0;
+    _MinY[id.x] = _TexSize.y - 1u;
+    _MaxY[id.x] = 0;
+}
+
+[numthreads(8,8,1)]
+void Detect (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint) _TexSize.x || id.y >= (uint) _TexSize.y)
+        return;
+
+    const float4 idPix = LOAD_TEXTURE2D_X(_Input, id.xy);
+    const uint vId = (uint) (idPix.a * 255.0);
+
+    if (vId == 0)
+        return;
+
+    InterlockedMin(_MinX[vId], id.x);
+    InterlockedMin(_MinY[vId], id.y);
+    InterlockedMax(_MaxX[vId], id.x);
+    InterlockedMax(_MaxY[vId], id.y);
+}

@@ -5,24 +5,33 @@
  *
  */
 
-using System;
-using System.Linq;
-using System.Collections.Generic;
-using UnityEngine;
-using Simulator.Bridge;
-using Simulator.Bridge.Data;
-using Simulator.Utilities;
-using Simulator.Sensors.UI;
-
 namespace Simulator.Sensors
 {
-    [SensorType("2D Perception", new[] { typeof(Detected2DObjectData) })]
-    public class PerceptionSensor2D : SensorBase
-    {
-        [SensorParameter]
-        [Range(1f, 100f)]
-        public float Frequency = 10.0f;
+    using System;
+    using System.Collections.Generic;
+    using UnityEngine;
+    using Bridge;
+    using Bridge.Data;
+    using Utilities;
+    using UI;
+    using Components;
+    using UnityEngine.Experimental.Rendering;
+    using UnityEngine.Rendering;
+    using UnityEngine.Rendering.HighDefinition;
 
+    [SensorType("2D Perception", new[] {typeof(Detected2DObjectData)})]
+    public class PerceptionSensor2D : FrequencySensorBase
+    {
+        private static class Properties
+        {
+            public static readonly int TexSize = Shader.PropertyToID("_TexSize");
+            public static readonly int Input = Shader.PropertyToID("_Input");
+            public static readonly int MinX = Shader.PropertyToID("_MinX");
+            public static readonly int MaxX = Shader.PropertyToID("_MaxX");
+            public static readonly int MinY = Shader.PropertyToID("_MinY");
+            public static readonly int MaxY = Shader.PropertyToID("_MaxY");
+        }
+        
         [SensorParameter]
         [Range(1, 1920)]
         public int Width = 1920;
@@ -43,51 +52,59 @@ namespace Simulator.Sensors
         [Range(0.01f, 2000.0f)]
         public float MaxDistance = 2000.0f;
 
-        public RangeTrigger cameraRangeTrigger;
-
         [SensorParameter]
         [Range(0.01f, 2000f)]
         public float DetectionRange = 100f;
 
+        [Range(0, 255)]
+        public int testId = 32;
+
         private uint seqId;
-        private uint objId;
-        private float nextSend;
 
-        RenderTexture activeRT;
+        private SensorRenderTarget renderTarget;
+        private RenderTexture activeRT;
 
-        private Dictionary<Collider, Detected2DObject> Detected = new Dictionary<Collider, Detected2DObject>();
-        private Detected2DObject[] Visualized = Array.Empty<Detected2DObject>();
+        private List<Detected2DObject> DetectedObjects = new List<Detected2DObject>();
 
         AAWireBox AAWireBoxes;
-
-        private float degHFOV;  // Horizontal Field of View, in degree
 
         private BridgeInstance Bridge;
         private Publisher<Detected2DObjectData> Publish;
 
-        private Camera Camera;
+        public Camera Camera;
+        public Camera SegmentationCamera;
+
+        public ComputeShader cs;
+
+        private ComputeBuffer minX;
+        private ComputeBuffer maxX;
+        private ComputeBuffer minY;
+        private ComputeBuffer maxY;
+
+        private uint[] minXarr = new uint[256];
+        private uint[] maxXarr = new uint[256];
+        private uint[] minYarr = new uint[256];
+        private uint[] maxYarr = new uint[256];
 
         [AnalysisMeasurement(MeasurementType.Count)]
         public int MaxTracked = -1;
-        
+
         public override SensorDistributionType DistributionType => SensorDistributionType.MainOrClient;
-        public override float PerformanceLoad { get; } = 0.2f;
+        public override float PerformanceLoad => 0.2f;
 
-        private IVehicleDynamics Dynamics;
+        private ShaderTagId passId;
+
+        protected override bool UseFixedUpdate => false;
+
         private IAgentController Controller;
-
-        private void Awake()
-        {
-            Camera = GetComponentInChildren<Camera>();
-        }
 
         protected override void Initialize()
         {
-            Dynamics = GetComponentInParent<IVehicleDynamics>();
             Controller = GetComponentInParent<IAgentController>();
+            
             activeRT = new RenderTexture(Width, Height, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
             {
-                dimension = UnityEngine.Rendering.TextureDimension.Tex2D,
+                dimension = TextureDimension.Tex2D,
                 antiAliasing = 1,
                 useMipMap = false,
                 useDynamicScale = false,
@@ -102,26 +119,37 @@ namespace Simulator.Sensors
             Camera.fieldOfView = FieldOfView;
             Camera.nearClipPlane = MinDistance;
             Camera.farClipPlane = MaxDistance;
+            Camera.gameObject.GetComponent<HDAdditionalCameraData>().hasPersistentHistory = true;
+
+            passId = new ShaderTagId("SimulatorSegmentationPass");
+            SegmentationCamera.fieldOfView = FieldOfView;
+            SegmentationCamera.nearClipPlane = MinDistance;
+            SegmentationCamera.farClipPlane = DetectionRange;
+            SegmentationCamera.gameObject.GetComponent<HDAdditionalCameraData>().customRender += OnSegmentationRender;
+            SegmentationCamera.gameObject.GetComponent<HDAdditionalCameraData>().hasPersistentHistory = true;
+            renderTarget = SensorRenderTarget.Create2D(Width, Height, GraphicsFormat.R8G8B8A8_UNorm);
+            SegmentationCamera.targetTexture = renderTarget;
+
+            minX = new ComputeBuffer(256, sizeof(uint));
+            maxX = new ComputeBuffer(256, sizeof(uint));
+            minY = new ComputeBuffer(256, sizeof(uint));
+            maxY = new ComputeBuffer(256, sizeof(uint));
 
             AAWireBoxes = gameObject.AddComponent<AAWireBox>();
             AAWireBoxes.Camera = Camera;
-
-            nextSend = Time.time + 1.0f / Frequency;
-
-            var radHFOV = 2 * Mathf.Atan(Mathf.Tan(Camera.fieldOfView * Mathf.Deg2Rad / 2) * Camera.aspect);
-            degHFOV = Mathf.Rad2Deg * radHFOV;
-
-            BoxCollider camBoxCollider = cameraRangeTrigger.GetComponent<BoxCollider>();
-            camBoxCollider.center = new Vector3(0, 0, DetectionRange / 2f);
-            camBoxCollider.size = new Vector3(2 * Mathf.Tan(radHFOV / 2) * DetectionRange, 3f, DetectionRange);
-
-            cameraRangeTrigger.SetCallbacks(OnCollider);
+            AAWireBoxes.IgnoreUpdates = true;
         }
 
         protected override void Deinitialize()
         {
             if (activeRT != null)
                 activeRT.Release();
+
+            renderTarget?.Release();
+            minX?.Release();
+            maxX?.Release();
+            minY?.Release();
+            maxY?.Release();
         }
 
         public override void OnBridgeSetup(BridgeInstance bridge)
@@ -130,127 +158,91 @@ namespace Simulator.Sensors
             Publish = Bridge.AddPublisher<Detected2DObjectData>(Topic);
         }
 
-        private void Update()
+        private void OnSegmentationRender(ScriptableRenderContext context, HDCamera hdCamera)
         {
-            MaxTracked = Math.Max(MaxTracked, Detected.Count);
+            var cmd = CommandBufferPool.Get();
+            SensorPassRenderer.Render(context, cmd, hdCamera, renderTarget, passId, SimulatorManager.Instance.SkySegmentationColor);
+
+            var clearKernel = cs.FindKernel("Clear");
+            cmd.SetComputeVectorParam(cs, Properties.TexSize, new Vector4(Width, Height, 1f / Width, 1f / Height));
+            cmd.SetComputeBufferParam(cs, clearKernel, Properties.MinX, minX);
+            cmd.SetComputeBufferParam(cs, clearKernel, Properties.MaxX, maxX);
+            cmd.SetComputeBufferParam(cs, clearKernel, Properties.MinY, minY);
+            cmd.SetComputeBufferParam(cs, clearKernel, Properties.MaxY, maxY);
+            cmd.DispatchCompute(cs, clearKernel, 4, 1, 1);
+
+            var detectKernel = cs.FindKernel("Detect");
+            cmd.SetComputeTextureParam(cs, detectKernel, Properties.Input, renderTarget.ColorHandle);
+            cmd.SetComputeVectorParam(cs, Properties.TexSize, new Vector4(Width, Height, 1f / Width, 1f / Height));
+            cmd.SetComputeBufferParam(cs, detectKernel, Properties.MinX, minX);
+            cmd.SetComputeBufferParam(cs, detectKernel, Properties.MaxX, maxX);
+            cmd.SetComputeBufferParam(cs, detectKernel, Properties.MinY, minY);
+            cmd.SetComputeBufferParam(cs, detectKernel, Properties.MaxY, maxY);
+            cmd.DispatchCompute(cs, detectKernel, HDRPUtilities.GetGroupSize(Width, 8), HDRPUtilities.GetGroupSize(Height, 8), 1);
+
+            context.ExecuteCommandBuffer(cmd);
+            cmd.Clear();
+            CommandBufferPool.Release(cmd);
+        }
+
+        protected override void SensorUpdate()
+        {
+            Camera.Render();
+            SegmentationCamera.Render();
+
+            minX.GetData(minXarr);
+            maxX.GetData(maxXarr);
+            minY.GetData(minYarr);
+            maxY.GetData(maxYarr);
+
+            DetectedObjects.Clear();
+
+            // 0 is reserved for clear color, 255 for non-agent segmentation
+            for (var i = 1; i < 255; ++i)
+            {
+                if (minXarr[i] == Width - 1 || maxXarr[i] == 0)
+                    continue;
+
+                var detected = GetDetectedObject(i);
+                if (detected != null)
+                    DetectedObjects.Add(detected);
+            }
+
+            MaxTracked = Math.Max(MaxTracked, DetectedObjects.Count);
             if (Bridge != null && Bridge.Status == Status.Connected)
             {
-                if (Time.time < nextSend)
-                {
-                    return;
-                }
-                nextSend = Time.time + 1.0f / Frequency;
-
                 Publish(new Detected2DObjectData()
                 {
                     Frame = Frame,
                     Sequence = seqId++,
                     Time = SimulatorManager.Instance.CurrentTime,
-                    Data = Detected.Values.ToArray(),
+                    Data = DetectedObjects.ToArray(),
                 });
             }
 
-            Visualized = Detected.Values.ToArray();
+            foreach (var obj in DetectedObjects)
+            {
+                var min = obj.Position - obj.Scale / 2;
+                var max = obj.Position + obj.Scale / 2;
+
+                var color = string.Equals(obj.Label, "Pedestrian") ? Color.yellow : Color.green;
+                AAWireBoxes.DrawBox(min, max, color);
+            }
+
+            var cmd = CommandBufferPool.Get();
+            Camera.Render();
+            AAWireBoxes.Draw(cmd);
+            AAWireBoxes.Clear();
+            HDRPUtilities.ExecuteAndClearCommandBuffer(cmd);
+            CommandBufferPool.Release(cmd);
         }
 
-        private void FixedUpdate()
+        private Detected2DObject GetDetectedObject(int segId)
         {
-            // Detected is updated OnClilider which is called in OnTriggerStay.
-            // So we clear it in FixedUpdate() which happens before OnTriggerStay.
-            // Details of excution order can be found at: https://docs.unity3d.com/Manual/ExecutionOrder.html
-            Detected.Clear();
-        }
-
-        Vector4 CalculateDetectedRect(Vector3 cen, Vector3 ext, Quaternion rotation)
-        {
-            ext.Set(ext.y, ext.z, ext.x);
-
-            var pts = new[]
+            if (!SimulatorManager.Instance.SegmentationIdMapping.TryGetEntityGameObject(segId, out var go, out var type))
             {
-                new Vector3(cen.x + ext.x, cen.y + ext.y, cen.z + ext.z),  // Back top right corner
-                new Vector3(cen.x + ext.x, cen.y + ext.y, cen.z - ext.z),  // Front top right corner
-                new Vector3(cen.x + ext.x, cen.y - ext.y, cen.z + ext.z),  // Back bottom right corner
-                new Vector3(cen.x + ext.x, cen.y - ext.y, cen.z - ext.z),  // Front bottom right corner
-                new Vector3(cen.x - ext.x, cen.y + ext.y, cen.z + ext.z),  // Back top left corner
-                new Vector3(cen.x - ext.x, cen.y + ext.y, cen.z - ext.z),  // Front top left corner
-                new Vector3(cen.x - ext.x, cen.y - ext.y, cen.z + ext.z),  // Back bottom left corner
-                new Vector3(cen.x - ext.x, cen.y - ext.y, cen.z - ext.z),  // Front bottom left corner
-            };
-
-            for (int i = 0; i < pts.Length; i++)
-            {
-                pts[i] = rotation * (pts[i] - cen) + cen;  // Rotate bounds around center in local space
-                pts[i] = Camera.WorldToViewportPoint(pts[i]);  // Convert world space to camera viewport
-            }
-
-            var min = pts[0];
-            var max = pts[0];
-            foreach (Vector3 v in pts)
-            {
-                min = Vector3.Min(min, v);
-                max = Vector3.Max(max, v);
-            }
-
-            float width = Camera.pixelWidth * (max.x - min.x);
-            float height = Camera.pixelHeight * (max.y - min.y);
-            float x = (Camera.pixelWidth * min.x) + (width / 2f);
-            float y = Camera.pixelHeight - ((Camera.pixelHeight * min.y) + (height / 2f));
-
-            if (x - width / 2 < 0)
-            {
-                var offset = Mathf.Abs(x - width / 2);
-                x = x + offset / 2;
-                width = width - offset;
-            }
-
-            if (x + width / 2 > Camera.pixelWidth)
-            {
-                var offset = Mathf.Abs(x + width / 2 - Camera.pixelWidth);
-                x = x - offset / 2;
-                width = width - offset;
-            }
-
-            if (y - height / 2 < 0)
-            {
-                var offset = Mathf.Abs(y - height / 2);
-                y = y + offset / 2;
-                height = height - offset;
-            }
-
-            if (y + height / 2 > Camera.pixelHeight)
-            {
-                var offset = Mathf.Abs(y + height / 2 - Camera.pixelHeight);
-                y = y - offset / 2;
-                height = height - offset;
-            }
-
-            return new Vector4(x, y, width, height);
-        }
-
-        void OnCollider(Collider other)
-        {
-            GameObject parent = other.transform.parent.gameObject;
-            if (parent == transform.parent.gameObject)
-            {
-                return;
-            }
-
-            if (!(other.gameObject.layer == LayerMask.NameToLayer("GroundTruth")) || !parent.activeInHierarchy)
-            {
-                return;
-            }
-
-            // Vector from camera to collider
-            Vector3 vectorFromCamToCol = other.transform.position - Camera.transform.position;
-            // Vector projected onto camera plane
-            Vector3 vectorProjToCamPlane = Vector3.ProjectOnPlane(vectorFromCamToCol, Camera.transform.up);
-            // Angle in degree between collider and camera forward direction
-            var angleHorizon = Vector3.Angle(vectorProjToCamPlane, Camera.transform.forward);
-
-            // Check if collider is out of field of view
-            if (angleHorizon > degHFOV / 2)
-            {
-                return;
+                Debug.LogError($"Entity with ID {segId} is not registered.");
+                return null;
             }
 
             uint id;
@@ -258,111 +250,71 @@ namespace Simulator.Sensors
             float linear_vel;
             float angular_vel;
 
-            if (parent.layer == LayerMask.NameToLayer("Agent"))
+            switch (type)
             {
-                id = Controller.GTID;
-                label = "Sedan";
-                linear_vel = Vector3.Dot(Dynamics.Velocity, other.transform.forward);
-                angular_vel = -Dynamics.AngularVelocity.y;
-            }
-            else if (parent.layer == LayerMask.NameToLayer("NPC"))
-            {
-                var npcC = parent.GetComponent<NPCController>();
-                id = npcC.GTID;
-                label = npcC.NPCLabel;
-                linear_vel = Vector3.Dot(npcC.GetVelocity(), other.transform.forward);
-                angular_vel = -npcC.GetAngularVelocity().y;
-
-            }
-            else if (parent.layer == LayerMask.NameToLayer("Pedestrian"))
-            {
-                var pedC = parent.GetComponent<PedestrianController>();
-                id = pedC.GTID;
-                label = "Pedestrian";
-                linear_vel = Vector3.Dot(pedC.CurrentVelocity, other.transform.forward);
-                angular_vel = -pedC.CurrentAngularVelocity.y;
-            }
-            else
-            {
-                return;
-            }
-
-            Vector3 size = ((BoxCollider)other).size;
-            // Convert from (Right/Up/Forward) to (Forward/Left/Up)
-            size.Set(size.z, size.x, size.y);
-
-            if (size.magnitude == 0)
-            {
-                return;
-            }
-
-            RaycastHit hit;
-            var start = Camera.transform.position;
-            var end = other.bounds.center;
-            var direction = (end - start).normalized;
-            var distance = (end - start).magnitude;
-            Ray cameraRay = new Ray(start, direction);
-            if (Physics.Raycast(cameraRay, out hit, distance, LayerMask.GetMask("Default", "Obstacle", "GroundTruth"), QueryTriggerInteraction.Collide))
-            {
-                if (hit.collider == other)
+                case SegmentationIdMapping.SegmentationEntityType.Agent:
                 {
-                    Vector4 detectedRect = CalculateDetectedRect(other.bounds.center, size * 0.5f, other.transform.rotation);
-
-                    if (detectedRect.z < 0 || detectedRect.w < 0)
-                    {
-                        return;
-                    }
-                    if (!Detected.ContainsKey(other))
-                    {
-                        Detected.Add(other, new Detected2DObject()
-                        {
-                            Id = id,
-                            Label = label,
-                            Score = 1.0f,
-                            Position = new Vector2(detectedRect.x, detectedRect.y),
-                            Scale = new Vector2(detectedRect.z, detectedRect.w),
-                            LinearVelocity = new Vector3(linear_vel, 0, 0),  // Linear velocity in forward direction of objects, in meters/sec
-                            AngularVelocity = new Vector3(0, 0, angular_vel),  // Angular velocity around up axis of objects, in radians/sec
-                        });
-                    }
-                    else
-                    {
-                        Detected[other].Position = new Vector2(detectedRect.x, detectedRect.y);
-                        Detected[other].Scale = new Vector2(detectedRect.z, detectedRect.w);
-                        Detected[other].LinearVelocity = new Vector3(linear_vel, 0, 0);
-                        Detected[other].AngularVelocity = new Vector3(0, 0, angular_vel);
-                    }
+                    var controller = go.GetComponent<IAgentController>();
+                    var dynamics = go.GetComponent<IVehicleDynamics>();
+                    id = controller.GTID;
+                    label = "Sedan";
+                    // TODO: verify forward vector
+                    linear_vel = Vector3.Dot(dynamics.Velocity, go.transform.forward);
+                    angular_vel = -dynamics.AngularVelocity.y;
+                }
+                    break;
+                case SegmentationIdMapping.SegmentationEntityType.NPC:
+                {
+                    var npcC = go.GetComponent<NPCController>();
+                    id = npcC.GTID;
+                    label = npcC.NPCLabel;
+                    linear_vel = Vector3.Dot(npcC.GetVelocity(), go.transform.forward);
+                    angular_vel = -npcC.GetAngularVelocity().y;
+                }
+                    break;
+                case SegmentationIdMapping.SegmentationEntityType.Pedestrian:
+                {
+                    var pedC = go.GetComponent<PedestrianController>();
+                    id = pedC.GTID;
+                    label = "Pedestrian";
+                    linear_vel = Vector3.Dot(pedC.CurrentVelocity, go.transform.forward);
+                    angular_vel = -pedC.CurrentAngularVelocity.y;
+                }
+                    break;
+                default:
+                {
+                    Debug.LogError($"Invalid entity type: {type.ToString()}");
+                    return null;
                 }
             }
+
+            if (id == Controller.GTID)
+                return null;
+
+            var posPix = new Vector2(((float) minXarr[segId] + maxXarr[segId]) / 2, ((float) minYarr[segId] + maxYarr[segId]) / 2);
+            posPix.y = Height - posPix.y;
+            var sizePix = new Vector2(maxXarr[segId] - minXarr[segId], maxYarr[segId] - minYarr[segId]);
+
+            return new Detected2DObject()
+            {
+                Id = id,
+                Label = label,
+                Score = 1.0f,
+                Position = new Vector2(posPix.x, posPix.y),
+                Scale = new Vector2(sizePix.x, sizePix.y),
+                LinearVelocity = new Vector3(linear_vel, 0, 0),
+                AngularVelocity = new Vector3(0, 0, angular_vel),
+            };
         }
 
         public override void OnVisualize(Visualizer visualizer)
         {
-            foreach (var box in Visualized)
-            {
-                var min = box.Position - box.Scale / 2;
-                var max = box.Position + box.Scale / 2;
-
-                Color color = Color.green;
-                if (box.Label == "Pedestrian")
-                {
-                    color = Color.yellow;
-                }
-
-                AAWireBoxes.DrawBox(min, max, color);
-            }
-            visualizer.UpdateRenderTexture(Camera.activeTexture, Camera.aspect);
+            visualizer.UpdateRenderTexture(activeRT, Camera.aspect);
         }
 
         public override void OnVisualizeToggle(bool state)
         {
             //
-        }
-
-        public bool CheckVisible(Bounds bounds)
-        {
-            var activeCameraPlanes = GeometryUtility.CalculateFrustumPlanes(Camera);
-            return GeometryUtility.TestPlanesAABB(activeCameraPlanes, bounds);
         }
     }
 }
